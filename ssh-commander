@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sys
+import logging
+from datetime import datetime
+from getpass import getpass
+from cryptography.fernet import Fernet
+import paramiko
+
+# --- Configuration ---
+CONFIG_PATH = os.path.expanduser("~/.ssh_commander.json")
+LOG_DIR = os.path.expanduser("~/ssh_logs")
+
+# --- Color Codes ---
+class Color:
+    CYAN = '\033[36m'
+    WHITE = '\033[97m'
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    END = '\033[0m'
+
+# --- Logging Setup ---
+def setup_logging(profile_name):
+    if not os.path.exists(LOG_DIR):
+        os.makedirs(LOG_DIR)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(LOG_DIR, f"{profile_name}_{timestamp}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+        ]
+    )
+    return log_file
+
+# --- Profile Management ---
+def get_config():
+    if not os.path.exists(CONFIG_PATH):
+        print(f"{Color.YELLOW}Configuration file not found. Creating a new one at {CONFIG_PATH}{Color.END}")
+        key = Fernet.generate_key()
+        config = {"key": key.decode(), "profiles": {}}
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(config, f, indent=2)
+        os.chmod(CONFIG_PATH, 0o600) # Restrict permissions
+        return config
+    
+    with open(CONFIG_PATH, 'r') as f:
+        return json.load(f)
+
+def save_config(config):
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(config, f, indent=2)
+
+def add_profile():
+    config = get_config()
+    fernet = Fernet(config['key'].encode())
+
+    name = input("Enter profile name: ")
+    if name in config["profiles"]:
+        print(f"{Color.RED}Profile '{name}' already exists.{Color.END}")
+        return
+
+    host = input("Enter host: ")
+    port = input("Enter port (default 22): ") or 22
+    user = input("Enter user: ")
+    auth_type = input("Enter auth type (password/key, default key): ").lower() or 'key'
+
+    profile = {
+        "host": host,
+        "port": int(port),
+        "user": user,
+        "auth_type": auth_type,
+        "macros": {}
+    }
+
+    if auth_type == 'password':
+        password = getpass("Enter password: ")
+        profile['password'] = fernet.encrypt(password.encode()).decode()
+    else:
+        default_key = os.path.expanduser("~/.ssh/id_rsa")
+        key_path = input(f"Enter key path (default {default_key}): ") or default_key
+        profile['key_path'] = key_path
+
+    config["profiles"][name] = profile
+    save_config(config)
+    print(f"{Color.GREEN}Profile '{name}' added successfully.{Color.END}")
+
+def list_profiles():
+    config = get_config()
+    profiles = config.get("profiles", {})
+    if not profiles:
+        print(f"{Color.YELLOW}No profiles found. Use 'add-profile' to create one.{Color.END}")
+        return
+
+    print(f"{Color.CYAN}Available Profiles:{Color.END}")
+    for name, p in profiles.items():
+        auth_info = f"auth={p['auth_type']}"
+        if p['auth_type'] == 'key':
+            auth_info += f", key={p.get('key_path', 'N/A')}"
+        print(f"  - {Color.WHITE}{name}{Color.END} ({p['user']}@{p['host']}:{p['port']}, {auth_info})")
+
+def remove_profile(name):
+    config = get_config()
+    if name not in config["profiles"]:
+        print(f"{Color.RED}Profile '{name}' not found.{Color.END}")
+        return
+    
+    del config["profiles"][name]
+    save_config(config)
+    print(f"{Color.GREEN}Profile '{name}' removed.{Color.END}")
+
+# --- SSH Execution ---
+def get_ssh_client(profile):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    config = get_config()
+
+    try:
+        if profile['auth_type'] == 'key':
+            client.connect(
+                profile['host'],
+                port=profile['port'],
+                username=profile['user'],
+                key_filename=os.path.expanduser(profile['key_path']),
+                timeout=10
+            )
+        elif profile['auth_type'] == 'password':
+            fernet = Fernet(config['key'].encode())
+            password = fernet.decrypt(profile['password'].encode()).decode()
+            client.connect(
+                profile['host'],
+                port=profile['port'],
+                username=profile['user'],
+                password=password,
+                timeout=10
+            )
+        return client
+    except paramiko.AuthenticationException:
+        print(f"{Color.RED}Authentication failed. Please check your credentials or key path.{Color.END}")
+    except paramiko.SSHException as e:
+        print(f"{Color.RED}SSH connection error: {e}{Color.END}")
+    except FileNotFoundError:
+        print(f"{Color.RED}SSH key file not found at '{profile['key_path']}'.{Color.END}")
+    except Exception as e:
+        print(f"{Color.RED}An unexpected error occurred: {e}{Color.END}")
+    return None
+
+def run_command(profile_name, command):
+    config = get_config()
+    profile = config.get("profiles", {}).get(profile_name)
+    if not profile:
+        print(f"{Color.RED}Profile '{profile_name}' not found.{Color.END}")
+        return
+
+    log_file = setup_logging(profile_name)
+    print(f"{Color.YELLOW}Saving session log to {log_file}{Color.END}")
+    logging.info(f"Connecting to {profile['user']}@{profile['host']}")
+    
+    client = get_ssh_client(profile)
+    if not client:
+        return
+
+    try:
+        print(f"{Color.CYAN}[{profile_name}]$ {command}{Color.END}")
+        logging.info(f"Executing command: {command}")
+        
+        stdin, stdout, stderr = client.exec_command(command)
+        
+        for line in iter(stdout.readline, ""):
+            print(f"{Color.WHITE}{line.strip()}{Color.END}")
+            logging.info(line.strip())
+            
+        for line in iter(stderr.readline, ""):
+            print(f"{Color.RED}{line.strip()}{Color.END}")
+            logging.error(line.strip())
+            
+    finally:
+        client.close()
+        logging.info("Connection closed.")
+
+def run_macro(profile_name, macro_name):
+    config = get_config()
+    profile = config.get("profiles", {}).get(profile_name)
+    if not profile:
+        print(f"{Color.RED}Profile '{profile_name}' not found.{Color.END}")
+        return
+
+    macro = profile.get("macros", {}).get(macro_name)
+    if not macro:
+        print(f"{Color.RED}Macro '{macro_name}' not found in profile '{profile_name}'.{Color.END}")
+        return
+
+    print(f"{Color.YELLOW}Running macro '{macro_name}' on '{profile_name}'...{Color.END}")
+    for command in macro:
+        run_command(profile_name, command)
+        print("-" * 20)
+
+def interactive_shell(profile_name):
+    config = get_config()
+    profile = config.get("profiles", {}).get(profile_name)
+    if not profile:
+        print(f"{Color.RED}Profile '{profile_name}' not found.{Color.END}")
+        return
+
+    log_file = setup_logging(profile_name)
+    print(f"{Color.YELLOW}Starting interactive shell. Session log: {log_file}{Color.END}")
+    logging.info(f"Starting interactive session for {profile['user']}@{profile['host']}")
+
+    client = get_ssh_client(profile)
+    if not client:
+        return
+
+    channel = client.invoke_shell()
+    
+    try:
+        while True:
+            command = input(f"{Color.CYAN}[{profile_name}]$ {Color.END}")
+            if command.lower() in ['exit', 'quit']:
+                break
+            
+            channel.send(command + '\n')
+            
+            # A simple way to read output, might need refinement for complex cases
+            while channel.recv_ready():
+                output = channel.recv(1024).decode('utf-8')
+                print(f"{Color.WHITE}{output.strip()}{Color.END}")
+                logging.info(output.strip())
+
+    except KeyboardInterrupt:
+        print(f"\n{Color.YELLOW}Exiting interactive shell.{Color.END}")
+    finally:
+        channel.close()
+        client.close()
+        logging.info("Interactive session closed.")
+
+# --- Main ---
+def main():
+    parser = argparse.ArgumentParser(
+        description="A Termux-friendly SSH client with profile management.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""
+Usage Examples:
+  # Add a new profile interactively
+  ssh-commander add-profile
+
+  # List all saved profiles
+  ssh-commander list
+
+  # Run a single command on a profile
+  ssh-commander run my-server 'df -h'
+
+  # Run a predefined macro
+  ssh-commander macro my-server status
+
+  # Start an interactive shell
+  ssh-commander shell my-server
+"""
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("add-profile", help="Add a new SSH profile.")
+    subparsers.add_parser("list", help="List all saved SSH profiles.")
+    
+    remove_parser = subparsers.add_parser("remove", help="Remove an SSH profile.")
+    remove_parser.add_argument("name", help="The name of the profile to remove.")
+
+    run_parser = subparsers.add_parser("run", help="Run a command on a profile.")
+    run_parser.add_argument("profile", help="The name of the profile.")
+    run_parser.add_argument("cmd", help="The command to execute.")
+
+    macro_parser = subparsers.add_parser("macro", help="Run a macro on a profile.")
+    macro_parser.add_argument("profile", help="The name of the profile.")
+    macro_parser.add_argument("macro_name", help="The name of the macro.")
+
+    shell_parser = subparsers.add_parser("shell", help="Start an interactive shell.")
+    shell_parser.add_argument("profile", help="The name of the profile.")
+
+    # Check for dependencies
+    try:
+        import paramiko
+        import cryptography
+    except ImportError:
+        print(f"{Color.RED}Error: Missing dependencies.{Color.END}")
+        print("Please install them using: pip install paramiko cryptography")
+        sys.exit(1)
+
+
+    args = parser.parse_args()
+
+    if args.command == "add-profile":
+        add_profile()
+    elif args.command == "list":
+        list_profiles()
+    elif args.command == "remove":
+        remove_profile(args.name)
+    elif args.command == "run":
+        run_command(args.profile, args.cmd)
+    elif args.command == "macro":
+        run_macro(args.profile, args.macro_name)
+    elif args.command == "shell":
+        interactive_shell(args.profile)
+
+if __name__ == "__main__":
+    main()
