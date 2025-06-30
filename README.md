@@ -21,7 +21,10 @@ This script provides a command-line interface to manage SSH connection profiles,
 Before using SSH Commander, ensure you have the necessary packages installed in Termux:
 
 ```bash
-apt install uv python-bcrypt SODIUM_INSTALL=system pip install pynacl uv pip install paramiko --system
+apt install uv openssh python
+apt install python-bcrypt python-cryptography
+SODIUM_INSTALL=system pip install pynacl
+uv pip install paramiko --system   
 ```
 
 ## Installation
